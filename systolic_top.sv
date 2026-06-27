@@ -8,19 +8,19 @@
 //
 // INTEGRATION DIAGRAM:
 //
-//  External                    ┌───────────────────┐
-//  Stimulus ──── start_i ─────►│                   │
+//  External                     ┌───────────────────┐
+//  Stimulus ──── start_i ─────► │                   │
 //                               │   systolic_ctrl   │── weight_valid_o ─► (user logic)
-//  weight_cols_i[N][N] ────────►│       (FSM)       │── load_weight_o ──► grid
-//                               │                   │── act_valid_o ───►  skew
-//                               │                   │── acc_clear_o ───►  (gated rst)
-//                               │                   │── result_valid_o ► (user logic)
+//  weight_cols_i[N][N] ────────►│       (FSM)       │── load_weight_o ──► to tell the weights are right next to their PEs, so load them
+//                               │                   │── act_valid_o ────► skew
+//                               │                   │── acc_clear_o ────► (gated rst)
+//                               │                   │── result_valid_o ─► (user logic)
 //                               └───────────────────┘
 //
-//  act_flat_i[N][DW] ──────────►┌───────────────────┐
-//                                │    input_skew     │── act_skewed[N][DW] ─►┐
-//  (act_valid_o from ctrl) ─────►│  (delay chains)   │                       │
-//                                └───────────────────┘                       │
+//  act_flat_i[N][DW] ───────────►┌───────────────────┐
+//                                │    input_skew     │── act_skewed[N][DW] ─► ┐
+//  (act_valid_o from ctrl) ─────►│  (delay chains)   │                        │
+//                                └───────────────────┘                        │
 //                                                                             ▼
 //                               ┌──────────────────────────────────────────────┐
 //                               │            systolic_array_grid               │
@@ -91,7 +91,7 @@ module systolic_top #(
 
   // Skew module outputs
   logic [ARRAY_N-1:0][DW-1:0]     act_skewed_w;        // Diagonally staggered data
-  logic [ARRAY_N-1:0]             act_skewed_valid_w;   // Staggered valid (unused by grid)
+  logic [ARRAY_N-1:0]             act_skewed_valid_w;   // Staggered valid (unused by grid as of now)
 
   // Gated reset: drop rst_n for one cycle to flush accumulators
   logic                            pe_rst_n_w;

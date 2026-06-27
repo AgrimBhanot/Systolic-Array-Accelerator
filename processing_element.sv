@@ -51,7 +51,7 @@ module processing_element #(
 
 
             if (load_weight) begin
-                weight_reg <= WEIGHT_WIDTH'(act_out);
+                weight_reg <= WEIGHT_WIDTH'(act_in);
             end
 
             act_out <= act_in;

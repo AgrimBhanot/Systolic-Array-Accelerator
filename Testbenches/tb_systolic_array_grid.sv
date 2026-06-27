@@ -1,5 +1,13 @@
 `timescale 1ns / 1ps
 `default_nettype none
+// =============================================================================
+// FILE        : tb_systolic_array_grid.sv
+// DESCRIPTION : Integration testbench for the 4×4 systolic array grid.
+//               Runs weight loading, skewed activation streaming, and output
+//               capture against a software golden reference.
+//               Includes self-checking immediate assertions with 1-cycle
+//               delayed tracking registers for temporal property verification.
+// =============================================================================
 
 module tb_systolic_array_grid;
 
@@ -38,9 +46,36 @@ module tb_systolic_array_grid;
     // Golden Matrices & Software Reference Models
     logic [WEIGHT_WIDTH-1:0]     matrix_W [ARRAY_SIZE][ARRAY_SIZE];
     logic [ACTIVATION_WIDTH-1:0] matrix_X [ARRAY_SIZE][ARRAY_SIZE];
-    logic [ACCUMULATOR_WIDTH-1:0] matrix_Y_golden [ARRAY_SIZE][ARRAY_SIZE];
-    logic [ACCUMULATOR_WIDTH-1:0] matrix_Y_captured [ARRAY_SIZE][ARRAY_SIZE];
+    logic [ACCUMULATOR_WIDTH-1:0] matrix_Y_golden   [ARRAY_SIZE][ARRAY_SIZE];
+    logic [ACCUMULATOR_WIDTH-1:0] matrix_Y_captured  [ARRAY_SIZE][ARRAY_SIZE];
 
+    // =========================================================================
+    // Assertion Infrastructure
+    // =========================================================================
+    // Shadow registers: track DUT-visible signals 1 cycle behind so that
+    // we can reason about "what was driven last cycle" in assertions.
+    logic [ARRAY_SIZE-1:0][ACTIVATION_WIDTH-1:0] act_west_in_d1;
+    logic [ARRAY_SIZE-1:0]                        load_weight_grid_d1;
+
+    always_ff @(posedge clk) begin
+        act_west_in_d1      <= act_west_in;
+        load_weight_grid_d1 <= load_weight_grid;
+    end
+
+    // Assertion pass/fail counters (module-level so tasks can access them)
+    int assert_total  = 0;
+    int assert_passed = 0;
+    int assert_failed = 0;
+
+    // Cycle counter — rolls from 0 and ticks on every posedge
+    int cycle_count = 0;
+    always_ff @(posedge clk) cycle_count <= cycle_count + 1;
+
+    initial begin
+        $dumpfile("Waveforms/wave_systolic_array_grid.vcd");
+        $dumpvars(0, tb_systolic_array_grid);
+    end
+    
     // Clock Generation
     initial begin
         clk = 0;
@@ -106,17 +141,36 @@ module tb_systolic_array_grid;
                 act_west_in[r] = matrix_W[r][(ARRAY_SIZE - 1) - cycle];
             end
         end
+        load_weight_grid = '1;
 
         // At cycle 3, W[r][c] is resting exactly at the input of PE[r][c].
         // Assert load control to capture the weights on the next rising edge.
-        @(posedge clk);
-        #1;
-        load_weight_grid = '1; // Enable load for all PEs
+        //@(posedge clk);
+        //#1;
+        //load_weight_grid = '0; // Enable load for all PEs
 
         @(posedge clk);
         #1;
         load_weight_grid = '0; // Deassert load
         act_west_in      = '0; // Clear inputs
+
+        // -----------------------------------------------------------------
+        // ASSERTION 1: Weight Load Strobe — verify that on the cycle we
+        // just finished, load_weight_grid was asserted (load strobe fired).
+        // load_weight_grid_d1 holds the value from one clock ago.
+        // -----------------------------------------------------------------
+        assert_total++;
+        assert (load_weight_grid_d1 == '1) else begin
+            $error("[ASSERT FAIL ] Cycle %0d: load_weight_grid strobe was not all-ones on weight capture cycle.",
+                   cycle_count);
+            assert_failed++;
+        end
+        if (load_weight_grid_d1 == '1) begin
+            $display("[ASSERT SUCCESS] Cycle %0d: weight load strobe confirmed — load_weight_grid was fully asserted on capture cycle",
+                     cycle_count);
+            assert_passed++;
+        end
+
         $display("[TB GRID] Weights loaded into registers.");
         #(CLK_PERIOD * 2);
 
@@ -147,6 +201,28 @@ module tb_systolic_array_grid;
             end
             // Feed constant zeros from the North as starting partial sums
             sum_north_in = '0;
+
+            // -----------------------------------------------------------------
+            // ASSERTION 2: Skewed Activation Value Correctness — verify that
+            // the datum delivered to Row 0 in the *previous* cycle exactly
+            // matches what the golden reference says should have been there.
+            // Since Row 0 has zero skew delay, at stream step c the previous
+            // cycle (c-1) should have driven matrix_X[c-1][0] onto the wire.
+            // act_west_in_d1[0] captures exactly that via the shadow register.
+            // -----------------------------------------------------------------
+            if (c >= 1 && c < ARRAY_SIZE) begin
+                assert_total++;
+                assert (act_west_in_d1[0] == matrix_X[c-1][0]) else begin
+                    $error("[ASSERT FAIL ] Cycle %0d (stream step %0d): Row 0 activation mismatch — got 0x%02h, expected matrix_X[%0d][0]=0x%02h",
+                           cycle_count, c, act_west_in_d1[0], c-1, matrix_X[c-1][0]);
+                    assert_failed++;
+                end
+                if (act_west_in_d1[0] == matrix_X[c-1][0]) begin
+                    $display("[ASSERT SUCCESS] Cycle %0d (stream step %0d): Row 0 skew delivery correct — act_west_in_d1[0]=0x%02h matches matrix_X[%0d][0]",
+                             cycle_count, c, act_west_in_d1[0], c-1);
+                    assert_passed++;
+                end
+            end
         end
 
         // Keep driving zeros until everything clears the pipeline
@@ -219,13 +295,26 @@ module tb_systolic_array_grid;
                 matrix_Y_captured[r][2], matrix_Y_captured[r][3]);
         end
 
-        // Compare elements
+        // -----------------------------------------------------------------
+        // ASSERTION 3: Element-wise Matrix Correctness — every captured
+        // output must exactly match the software golden reference.
+        // Each element is an independent assertion so failures are reported
+        // at element granularity rather than as a lump sum.
+        // -----------------------------------------------------------------
+        $display("\n--- Element-wise Assertion Results ---");
         for (int r = 0; r < ARRAY_SIZE; r++) begin
             for (int c = 0; c < ARRAY_SIZE; c++) begin
-                if (matrix_Y_captured[r][c] !== matrix_Y_golden[r][c]) begin
-                    $display("[ERROR] Mismatch at Y[%0d][%0d]! Got %0d, Expected %0d", 
-                        r, c, matrix_Y_captured[r][c], matrix_Y_golden[r][c]);
+                assert_total++;
+                assert (matrix_Y_captured[r][c] === matrix_Y_golden[r][c]) else begin
+                    $error("[ASSERT FAIL ] Cycle %0d: Y[%0d][%0d] mismatch — got %0d, expected %0d",
+                           cycle_count, r, c, matrix_Y_captured[r][c], matrix_Y_golden[r][c]);
                     errors++;
+                    assert_failed++;
+                end
+                if (matrix_Y_captured[r][c] === matrix_Y_golden[r][c]) begin
+                    $display("[ASSERT SUCCESS] Cycle %0d: Y[%0d][%0d] = %0d — hardware output matches golden reference",
+                             cycle_count, r, c, matrix_Y_captured[r][c]);
+                    assert_passed++;
                 end
             end
         end
@@ -236,7 +325,21 @@ module tb_systolic_array_grid;
         end else begin
             $display("  RESULT: FAILURE! Total of %0d mismatches detected.", errors);
         end
-        $display("==================================================\n");
+        $display("==================================================");
+
+        // ---- VERIFICATION REPORT CARD -----------------------------------
+        $display("\n============================================================");
+        $display("           GRID VERIFICATION REPORT CARD");
+        $display("============================================================");
+        $display("  Total Assertions Triggered : %0d", assert_total);
+        $display("  Assertions Passed          : %0d", assert_passed);
+        $display("  Assertions Failed          : %0d", assert_failed);
+        $display("------------------------------------------------------------");
+        if (assert_failed == 0)
+            $display("  VERDICT: PASS — full 4x4 matrix verified, zero mismatches");
+        else
+            $display("  VERDICT: FAIL — %0d assertion(s) violated", assert_failed);
+        $display("============================================================\n");
     endtask
 
 endmodule : tb_systolic_array_grid

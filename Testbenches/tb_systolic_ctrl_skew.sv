@@ -100,6 +100,12 @@ module tb_systolic_ctrl_skew;
   // ---------------------------------------------------------------------------
   // Clock Generation
   // ---------------------------------------------------------------------------
+
+  initial begin
+    $dumpfile("Waveforms/wave_systolic_ctrl_skew.vcd");
+    $dumpvars(0, tb_systolic_ctrl_skew);
+  end
+
   initial begin
     clk = 1'b0;
     forever #CLK_HALF clk = ~clk;
@@ -110,6 +116,37 @@ module tb_systolic_ctrl_skew;
   // ---------------------------------------------------------------------------
   int unsigned total_errors;
 
+  // Shared assertion counters — incremented by check() and the inline assert blocks
+  int assert_total  = 0;
+  int assert_passed = 0;
+  int assert_failed = 0;
+
+  // 1-cycle delayed tracking registers for temporal assertions.
+  // These shadow key outputs one clock behind so we can verify
+  // properties like "acc_clear was high exactly one cycle ago".
+  fsm_state_t  state_o_d1;
+  logic        acc_clear_d1;
+  logic        result_valid_d1;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      state_o_d1       <= IDLE;
+      acc_clear_d1     <= 1'b0;
+      result_valid_d1  <= 1'b0;
+    end else begin
+      state_o_d1       <= state_o;
+      acc_clear_d1     <= acc_clear_o;
+      result_valid_d1  <= result_valid_o;
+    end
+  end
+
+  // Cycle counter for readable assertion messages
+  int cycle_count = 0;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) cycle_count <= 0;
+    else        cycle_count <= cycle_count + 1;
+  end
+
   // Skew-verify variables — declared at module level (iverilog does not
   // support 'automatic' on variables inside begin..end named blocks).
   int unsigned skew_cycle [N];
@@ -119,16 +156,22 @@ module tb_systolic_ctrl_skew;
   // ---------------------------------------------------------------------------
   // Helper: assert with message
   // ---------------------------------------------------------------------------
+  // Wraps an immediate assert so that every check prints a cycle-stamped
+  // success line on pass and a $error on fail — both update shared counters.
   task automatic check(
       input logic      actual,
       input logic      expected,
       input string     msg
   );
+    assert_total++;
     if (actual !== expected) begin
-      $display("[FAIL] @%0t  %s  (got %0b, exp %0b)", $time, msg, actual, expected);
+      $error("[ASSERT FAIL ] Cycle %0d: %s  (got %b, expected %b)",
+             cycle_count, msg, actual, expected);
       total_errors++;
+      assert_failed++;
     end else begin
-      $display("[PASS] @%0t  %s", $time, msg);
+      $display("[ASSERT SUCCESS] Cycle %0d: %s", cycle_count, msg);
+      assert_passed++;
     end
   endtask
 
@@ -155,6 +198,22 @@ module tb_systolic_ctrl_skew;
     check(|act_valid_o,           1'b0, "act_valid_o all-LOW in IDLE");
     check(acc_clear_o,            1'b0, "acc_clear_o LOW in IDLE");
     check(result_valid_o,         1'b0, "result_valid_o LOW in IDLE");
+
+    // -----------------------------------------------------------------
+    // ASSERTION A: Post-reset state correctness — all control outputs
+    // must be de-asserted after reset. This is a hard RTL invariant.
+    // -----------------------------------------------------------------
+    assert_total++;
+    assert (state_o == IDLE && weight_valid_o == 0 && acc_clear_o == 0 && result_valid_o == 0) else begin
+      $error("[ASSERT FAIL ] Cycle %0d: post-reset invariant violated — one or more control signals active in IDLE",
+             cycle_count);
+      assert_failed++;
+    end
+    if (state_o == IDLE && weight_valid_o == 0 && acc_clear_o == 0 && result_valid_o == 0) begin
+      $display("[ASSERT SUCCESS] Cycle %0d: post-reset invariant confirmed — FSM in IDLE, all control outputs quiescent",
+               cycle_count);
+      assert_passed++;
+    end
 
     // ── Drive constant activation values so we can track the skew delay ──────
     // Each row r gets a distinct marker value: 8'(r + 1).
@@ -204,6 +263,23 @@ module tb_systolic_ctrl_skew;
     check(acc_clear_o,            1'b0, "acc_clear_o LOW after first COMPUTE cycle");
     check(&act_valid_o,           1'b1, "act_valid_o HIGH on 2nd COMPUTE cycle");
 
+    // -----------------------------------------------------------------
+    // ASSERTION B: acc_clear one-shot property — using the 1-cycle
+    // shadow register, confirm it was high exactly one cycle ago and
+    // is now low. This proves the one-shot pulse shape is correct.
+    // -----------------------------------------------------------------
+    assert_total++;
+    assert (acc_clear_d1 == 1'b1 && acc_clear_o == 1'b0) else begin
+      $error("[ASSERT FAIL ] Cycle %0d: acc_clear_o one-shot violated — d1=%b, current=%b (expected high then low)",
+             cycle_count, acc_clear_d1, acc_clear_o);
+      assert_failed++;
+    end
+    if (acc_clear_d1 == 1'b1 && acc_clear_o == 1'b0) begin
+      $display("[ASSERT SUCCESS] Cycle %0d: acc_clear one-shot confirmed — was high last cycle, deasserted now as required",
+               cycle_count);
+      assert_passed++;
+    end
+
     // Wait remaining COMPUTE cycles.
     repeat (int'(COMPUTE_CYCLES) - 2) @(negedge clk);
 
@@ -212,6 +288,23 @@ module tb_systolic_ctrl_skew;
     check(state_o == WRITE_BACK,  1'b1, "State == WRITE_BACK after COMPUTE");
     check(result_valid_o,         1'b1, "result_valid_o HIGH in WRITE_BACK");
     check(|act_valid_o,           1'b0, "act_valid_o LOW in WRITE_BACK");
+
+    // -----------------------------------------------------------------
+    // ASSERTION C: COMPUTE → WRITE_BACK transition — state_o_d1 must
+    // be COMPUTE on the cycle before, confirming the FSM advanced on
+    // schedule without missing or skipping the transition.
+    // -----------------------------------------------------------------
+    assert_total++;
+    assert (state_o_d1 == COMPUTE && state_o == WRITE_BACK) else begin
+      $error("[ASSERT FAIL ] Cycle %0d: FSM COMPUTE->WRITE_BACK transition missed — prev_state=%0d, curr_state=%0d (expect %0d->%0d)",
+             cycle_count, state_o_d1, state_o, COMPUTE, WRITE_BACK);
+      assert_failed++;
+    end
+    if (state_o_d1 == COMPUTE && state_o == WRITE_BACK) begin
+      $display("[ASSERT SUCCESS] Cycle %0d: FSM transition COMPUTE->WRITE_BACK confirmed — state advanced exactly on schedule",
+               cycle_count);
+      assert_passed++;
+    end
 
     // ── Back to IDLE ──────────────────────────────────────────────────────────
     repeat (int'(WB_CYCLES)) @(negedge clk);
@@ -293,7 +386,21 @@ module tb_systolic_ctrl_skew;
     end else begin
       $display("  RESULT: FAILURE! %0d check(s) failed.", total_errors);
     end
-    $display("==================================================\n");
+    $display("==================================================");
+
+    // ---- VERIFICATION REPORT CARD ---------------------------------------
+    $display("\n============================================================");
+    $display("        CTRL + SKEW VERIFICATION REPORT CARD");
+    $display("============================================================");
+    $display("  Total Assertions Triggered : %0d", assert_total);
+    $display("  Assertions Passed          : %0d", assert_passed);
+    $display("  Assertions Failed          : %0d", assert_failed);
+    $display("------------------------------------------------------------");
+    if (assert_failed == 0)
+      $display("  VERDICT: PASS — FSM sequence and skew chain fully verified");
+    else
+      $display("  VERDICT: FAIL — %0d assertion(s) violated", assert_failed);
+    $display("============================================================\n");
 
     $finish;
   end
